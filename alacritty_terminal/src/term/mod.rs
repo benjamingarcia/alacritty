@@ -24,6 +24,7 @@ use crate::term::color::Rgb;
 use crate::term::render::RenderableContent;
 use crate::term::search::RegexSearch;
 use crate::vi_mode::{ViModeCursor, ViMotion};
+use std::ops::RangeInclusive;
 
 pub mod cell;
 pub mod color;
@@ -78,6 +79,129 @@ impl Default for TermMode {
             | TermMode::URGENCY_HINTS
     }
 }
+
+type CharWidth = usize;
+type LatestCol = (Column, CharWidth);
+
+// Iterator that yields cells needing render.
+//
+// Yields cells that require work to be displayed (that is, not a an empty
+// background cell). Additionally, this manages some state of the grid only
+// relevant for rendering like temporarily changing the cell with the cursor.
+//
+// This manages the cursor during a render. The cursor location is inverted to
+// draw it, and reverted after drawing to maintain state.
+// pub struct TextRunIter<'a, C> {
+// inner: DisplayIter<'a, Cell>,
+// grid: &'a Grid<Cell>,
+// cursor: RenderableCursor,
+// config: &'a Config<C>,
+// colors: &'a color::List,
+// selection: Option<SelectionRange<Line>>,
+// search: RenderableSearch<'a>,
+// run_start: Option<RunStart>,
+// latest_col: Option<LatestCol>,
+// buffer_text: String,
+// buffer_extra: Vec<Option<Vec<char>>>,
+// viewport_match: Option<RangeInclusive<Point>>,
+// }
+//
+// impl<'a, C> Iterator for TextRunIter<'a, C> {
+// type Item = TextRun;
+//
+// Gets the next renderable cell.
+//
+// Skips empty (background) cells and applies any flags to the cell state
+// (eg. invert fg and bg colors).
+// #[inline]
+// fn next(&mut self) -> Option<Self::Item> {
+// let mut output = None;
+// loop {
+// if self.cursor.point == self.inner.point() {
+// Handle cursor rendering.
+// let selected = self.is_selected(self.cursor.point);
+// let buffer_point = self.grid.visible_to_buffer(self.cursor.point);
+// let search_matched = self.search.advance(buffer_point);
+// let mut uiflags = UIFlags::empty();
+// if selected {
+// uiflags |= UIFlags::SELECTED;
+// }
+// if search_matched {
+// uiflags |= UIFlags::SEARCH_MATCHED;
+// if let Some(viewport_match) = &self.viewport_match {
+// if viewport_match.contains(&self.cursor.point) {
+// uiflags |= UIFlags::FOCUSED_MATCH;
+// }
+// }
+// }
+// if self.cursor.rendered {
+// if self.next_cursor_cell(&mut uiflags).is_none() {
+// break;
+// }
+// } else {
+// output = self.next_cursor(&mut uiflags);
+// break;
+// }
+// } else if let Some(cell) = self.inner.next() {
+// let point = Point::new(cell.line, cell.column);
+// let selected = self.is_selected(point);
+// let search_matched = self.search.advance(self.grid.visible_to_buffer(point));
+// let has_wide_char_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+// skip empty cells and wide char spacers.
+// if (cell.is_empty() || has_wide_char_spacer) && !selected && !search_matched {
+// continue;
+// }
+// let mut uiflags = UIFlags::empty();
+// if selected {
+// uiflags |= UIFlags::SELECTED;
+// }
+// if search_matched {
+// uiflags |= UIFlags::SEARCH_MATCHED;
+// if let Some(viewport_match) = &self.viewport_match {
+// if viewport_match.contains(&point) {
+// uiflags |= UIFlags::FOCUSED_MATCH;
+// }
+// }
+// }
+// if self.latest_col.is_none() || self.run_start.is_none() {
+// Initial state, this should only be hit on the first next() call of
+// iterator
+// self.run_start = Some(RunStart {
+// line: cell.line,
+// column: cell.column,
+// fg: cell.fg,
+// bg: cell.bg,
+// uiflags,
+// flags: cell.flags,
+// });
+// } else if self.is_end_of_run(&cell, uiflags) {
+// If we find a run break, return what we have so far and start a new run.
+// output = self.produce_char_run(cell, uiflags);
+// break;
+// }
+// Build up buffer and track the latest column we've seen
+// let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+// self.latest_col = Some((cell.column, width));
+// self.buffer_content(&cell);
+// } else {
+// break;
+// }
+// }
+// Check for any remaining buffered content and return it as a text run.
+// This is a destructive operation, it will return None after it executes once.
+// output.or_else(|| {
+// if !self.buffer_text.is_empty() || !self.buffer_extra.is_empty() {
+// let start = self.run_start.take()?;
+// let latest_col = self.latest_col.take()?;
+// Save leftover buffer and empty it
+// let prev_buffered = self.drain_buffer();
+// Some(self.build_text_run(start, latest_col, prev_buffered))
+// } else {
+// None
+// }
+// })
+// }
+// }
 
 pub struct VisualBell {
     /// Visual bell animation.
@@ -621,19 +745,17 @@ impl<T> Term<T> {
         &mut self.grid
     }
 
-    /// Terminal content required for rendering.
+    /// Iterate over the text runs in the terminal
     ///
-    /// A renderable cell is any cell which has content other than the default background color.
-    /// Cells with an alternate background color are considered renderable, as are cells with any
-    /// text content.
-    ///
-    /// The cursor itself is always considered renderable and provided separately.
+    /// A text run is a continuous line of cells that all share the same rendering properties
+    /// (background color, foreground color, etc.).
     pub fn renderable_content<'b, C>(
         &'b self,
         config: &'b Config<C>,
         show_cursor: bool,
+        viewport_match: Option<RangeInclusive<Point>>,
     ) -> RenderableContent<'_, T, C> {
-        RenderableContent::new(&self, config, show_cursor)
+        RenderableContent::new(&self, config, show_cursor, viewport_match)
     }
 
     /// Get the selection within the viewport.
@@ -1958,6 +2080,7 @@ pub enum ClipboardType {
     Selection,
 }
 
+#[derive(Clone)]
 struct TabStops {
     tabs: Vec<bool>,
 }
@@ -2429,7 +2552,7 @@ mod benches {
         mem::swap(&mut terminal.grid, &mut grid);
 
         b.iter(|| {
-            let iter = terminal.renderable_cells(&config, true);
+            let iter = terminal.renderable_content(&config, true, None);
             for cell in iter {
                 test::black_box(cell);
             }
